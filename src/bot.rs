@@ -3,6 +3,7 @@ use crate::config::{Action, Config};
 use crate::telegram::{self, ForwardMessage, PinChatMessage, WebhookReply};
 
 use std::collections::HashMap;
+use std::time::SystemTime;
 
 use rust_persian_tools::{
     persian_chars::HasPersian,
@@ -11,18 +12,26 @@ use rust_persian_tools::{
 };
 use telegram_types::bot::{
     methods::{
-        ApproveJoinRequest, ChatTarget, DeclineJoinRequest, DeleteMessage, ReplyMarkup,
-        RestrictChatMember, SendMessage, TelegramResult,
+        ApproveJoinRequest, AnswerCallbackQuery, ChatTarget, DeclineJoinRequest, DeleteMessage,
+        GetChatMember, ReplyMarkup, RestrictChatMember, SendMessage, TelegramResult,
     },
     types::{
-        ChatId, ChatPermissions, InlineKeyboardButton, InlineKeyboardButtonPressed,
+        ChatId, ChatMember, ChatPermissions, InlineKeyboardButton, InlineKeyboardButtonPressed,
         InlineKeyboardMarkup, Message, MessageId, ParseMode, Update, UpdateContent, User, UserId,
     },
 };
+use serde_json::json;
 use worker::*;
 
 const JOIN_PREFIX: &str = "_JOIN_";
 type FnCmd = dyn Fn(&Bot, &Message) -> Result<Response>;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReportEntry {
+    group_id: i64,
+    reported_by: i64,
+    timestamp: u64,
+}
 
 pub struct Bot {
     _token: String,
@@ -196,9 +205,72 @@ impl Bot {
         .await;
     }
 
+    async fn send_welcome_for_new_member(&self, user: &User, chat_id: ChatId) -> Result<()> {
+        let user_mention = format!("[{}](tg://user?id={})", user.first_name, user.id.0);
+        let welcome_text = format!("کاربر جدید جوین شد: {} (ID: {})", user_mention, user.id.0);
+
+        let report_button = vec![vec![InlineKeyboardButton {
+            text: "Report".to_string(),
+            pressed: InlineKeyboardButtonPressed::CallbackData(format!("report:{}", user.id.0)),
+        }]];
+
+        let markup = ReplyMarkup::InlineKeyboard(InlineKeyboardMarkup {
+            inline_keyboard: report_button,
+        });
+
+        let _ = telegram::send_json_request(
+            &self._token,
+            SendMessage::new(ChatTarget::Id(chat_id), welcome_text)
+                .parse_mode(ParseMode::Markdown)
+                .reply_markup(markup),
+        ).await?;
+
+        Ok(())
+    }
+
+    async fn log_spammer(&self, user_id: i64, group_id: i64, reported_by: i64) -> Result<()> {
+        let key = format!("spammers:{}", user_id);
+        let get_res = self.kv.get(&key).text().await?;
+
+        let mut entries: Vec<ReportEntry> = if let Some(json_str) = get_res {
+            serde_json::from_str(&json_str).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        if !entries.iter().any(|e| e.group_id == group_id) {
+            entries.push(ReportEntry {
+                group_id,
+                reported_by,
+                timestamp: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            });
+        }
+
+        let json_value = serde_json::to_string(&entries).map_err(|e| Error::RustError(e.to_string()))?;
+        self.kv.put(&key, json_value)?.execute().await?;
+
+        Ok(())
+    }
+
     pub async fn process(&self, update: &Update) -> Result<Response> {
         match &update.content {
             Some(UpdateContent::Message(m)) => {
+                if let Some(new_members) = &m.new_chat_members {
+                    if !self.config.bot.allowed_chats_id.contains(&m.chat.id) {
+                        return Response::empty();
+                    }
+                    if let Some(user) = new_members.first() {
+                        if user.first_name.has_persian(true) || user.first_name.has_arabic() {
+                            return Response::empty();
+                        }
+                        self.send_welcome_for_new_member(user, m.chat.id).await?;
+                        return Response::empty();
+                    }
+                }
+
                 if !self.config.bot.allowed_chats_id.contains(&m.chat.id) {
                     // report unallowed chats
                     return self.forward(&m, self.config.bot.report_chat_id);
@@ -279,6 +351,67 @@ impl Bot {
                             } else {
                                 self.decline_join_request(msg.chat.id, q.from.id)
                             };
+                        }
+                    }
+
+                    if let Some(data) = &q.data {
+                        if data.starts_with("report:") {
+                            let parts: Vec<&str> = data.split(':').collect();
+                            if parts.len() == 2 {
+                                let reported_id = parts[1].parse::<i64>().map_err(|_| Error::RustError("Invalid user ID".to_string()))?;
+                                
+                                let is_admin = if self.config.bot.admin_users_id.contains(&q.from.id) {
+                                    true
+                                } else {
+                                    let get_member_res = telegram::send_json_request(
+                                        &self._token,
+                                        GetChatMember {
+                                            chat_id: ChatTarget::Id(msg.chat.id),
+                                            user_id: q.from.id,
+                                        },
+                                    ).await?
+                                    .json::<TelegramResult<ChatMember>>().await?;
+
+                                    if let Some(member) = get_member_res.result {
+                                        matches!(member.status.as_str(), Some("administrator" | "creator"))
+                                    } else {
+                                        false
+                                    }
+                                };
+
+                                if is_admin {
+                                    self.log_spammer(reported_id, msg.chat.id.0, q.from.id.0).await?;
+                                    
+                                    let _ = telegram::send_json_request(
+                                        &self._token,
+                                        AnswerCallbackQuery {
+                                            callback_query_id: q.id.clone(),
+                                            text: Some("کاربر گزارش شد و به دیتابیس اسپمرها اضافه شد!".to_string()),
+                                            show_alert: Some(false),
+                                            ..Default::default()
+                                        },
+                                    ).await?;
+                                    
+                                    let _ = telegram::send_json_request(
+                                        &self._token,
+                                        DeleteMessage {
+                                            chat_id: ChatTarget::Id(msg.chat.id),
+                                            message_id: msg.message_id,
+                                        },
+                                    ).await;
+                                } else {
+                                    let _ = telegram::send_json_request(
+                                        &self._token,
+                                        AnswerCallbackQuery {
+                                            callback_query_id: q.id.clone(),
+                                            text: Some("فقط ادمین‌های گروه می‌تونن گزارش بدن!".to_string()),
+                                            show_alert: Some(true),
+                                            ..Default::default()
+                                        },
+                                    ).await?;
+                                }
+                                return Response::empty();
+                            }
                         }
                     }
                 }

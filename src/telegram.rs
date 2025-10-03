@@ -4,6 +4,7 @@ use telegram_types::bot::{
     types::{ChatId, Message, MessageId},
 };
 use worker::{Error, Fetch, Headers, Request, RequestInit, Response, Result};
+use telegram_types::bot::types::{ChatMember, UserId};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct WebhookReply<M: Method> {
@@ -42,6 +43,17 @@ pub struct ForwardMessage {
 impl Method for ForwardMessage {
     const NAME: &'static str = "forwardMessage";
     type Item = Message;
+}
+
+#[derive(Clone, Serialize)]
+pub struct GetChatMember {
+    pub chat_id: ChatTarget,
+    pub user_id: UserId,
+}
+
+impl Method for GetChatMember {
+    const NAME: &'static str = "getChatMember";
+    type Item = ChatMember;
 }
 
 pub async fn send_json_request<T: Method>(token: &str, request: T) -> Result<Response> {
