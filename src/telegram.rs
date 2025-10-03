@@ -1,10 +1,10 @@
 use serde::Serialize;
+use telegram_types::bot::types::{ChatMember, UserId};
 use telegram_types::bot::{
-    methods::Method,
+    methods::{ChatTarget, Method},
     types::{ChatId, Message, MessageId},
 };
 use worker::{Error, Fetch, Headers, Request, RequestInit, Response, Result};
-use telegram_types::bot::types::{ChatMember, UserId};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct WebhookReply<M: Method> {
@@ -46,12 +46,12 @@ impl Method for ForwardMessage {
 }
 
 #[derive(Clone, Serialize)]
-pub struct GetChatMember {
-    pub chat_id: ChatTarget,
+pub struct GetChatMember<'a> {
+    pub chat_id: ChatTarget<'a>,
     pub user_id: UserId,
 }
 
-impl Method for GetChatMember {
+impl<'a> Method for GetChatMember<'a> {
     const NAME: &'static str = "getChatMember";
     type Item = ChatMember;
 }

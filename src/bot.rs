@@ -5,22 +5,18 @@ use crate::telegram::{self, ForwardMessage, PinChatMessage, WebhookReply};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use rust_persian_tools::{
-    persian_chars::HasPersian,
-    arabic_chars::HasArabic,
-    digits::DigitsEn2Fa,
-};
+use rust_persian_tools::{arabic_chars::HasArabic, digits::DigitsEn2Fa, persian_chars::HasPersian};
 use telegram_types::bot::{
     methods::{
-        ApproveJoinRequest, AnswerCallbackQuery, ChatTarget, DeclineJoinRequest, DeleteMessage,
+        AnswerCallbackQuery, ApproveJoinRequest, ChatTarget, DeclineJoinRequest, DeleteMessage,
         GetChatMember, ReplyMarkup, RestrictChatMember, SendMessage, TelegramResult,
     },
     types::{
-        ChatId, ChatMember, ChatPermissions, InlineKeyboardButton, InlineKeyboardButtonPressed,
-        InlineKeyboardMarkup, Message, MessageId, ParseMode, Update, UpdateContent, User, UserId,
+        ChatId, ChatMember, ChatMemberStatus, ChatPermissions, InlineKeyboardButton,
+        InlineKeyboardButtonPressed, InlineKeyboardMarkup, Message, MessageId, ParseMode, Update,
+        UpdateContent, User, UserId,
     },
 };
-use serde_json::json;
 use worker::*;
 
 const JOIN_PREFIX: &str = "_JOIN_";
@@ -223,7 +219,8 @@ impl Bot {
             SendMessage::new(ChatTarget::Id(chat_id), welcome_text)
                 .parse_mode(ParseMode::Markdown)
                 .reply_markup(markup),
-        ).await?;
+        )
+        .await?;
 
         Ok(())
     }
@@ -249,7 +246,8 @@ impl Bot {
             });
         }
 
-        let json_value = serde_json::to_string(&entries).map_err(|e| Error::RustError(e.to_string()))?;
+        let json_value =
+            serde_json::to_string(&entries).map_err(|e| Error::RustError(e.to_string()))?;
         self.kv.put(&key, json_value)?.execute().await?;
 
         Ok(())
@@ -258,7 +256,8 @@ impl Bot {
     pub async fn process(&self, update: &Update) -> Result<Response> {
         match &update.content {
             Some(UpdateContent::Message(m)) => {
-                if let Some(new_members) = &m.new_chat_members {
+                if !m.new_chat_members.is_empty() {
+                    let new_members = &m.new_chat_members;
                     if !self.config.bot.allowed_chats_id.contains(&m.chat.id) {
                         return Response::empty();
                     }
@@ -358,57 +357,74 @@ impl Bot {
                         if data.starts_with("report:") {
                             let parts: Vec<&str> = data.split(':').collect();
                             if parts.len() == 2 {
-                                let reported_id = parts[1].parse::<i64>().map_err(|_| Error::RustError("Invalid user ID".to_string()))?;
-                                
-                                let is_admin = if self.config.bot.admin_users_id.contains(&q.from.id) {
-                                    true
-                                } else {
-                                    let get_member_res = telegram::send_json_request(
-                                        &self._token,
-                                        GetChatMember {
-                                            chat_id: ChatTarget::Id(msg.chat.id),
-                                            user_id: q.from.id,
-                                        },
-                                    ).await?
-                                    .json::<TelegramResult<ChatMember>>().await?;
+                                let reported_id = parts[1]
+                                    .parse::<i64>()
+                                    .map_err(|_| Error::RustError("Invalid user ID".to_string()))?;
 
-                                    if let Some(member) = get_member_res.result {
-                                        matches!(member.status.as_str(), Some("administrator" | "creator"))
+                                let is_admin =
+                                    if self.config.bot.admin_users_id.contains(&q.from.id) {
+                                        true
                                     } else {
-                                        false
-                                    }
-                                };
+                                        let get_member_res = telegram::send_json_request(
+                                            &self._token,
+                                            GetChatMember {
+                                                chat_id: ChatTarget::Id(msg.chat.id),
+                                                user_id: q.from.id,
+                                            },
+                                        )
+                                        .await?
+                                        .json::<TelegramResult<ChatMember>>()
+                                        .await?;
+
+                                        if let Some(member) = get_member_res.result {
+                                            member.status == ChatMemberStatus::Administrator
+                                                || member.status == ChatMemberStatus::Creator
+                                        } else {
+                                            false
+                                        }
+                                    };
 
                                 if is_admin {
-                                    self.log_spammer(reported_id, msg.chat.id.0, q.from.id.0).await?;
-                                    
+                                    self.log_spammer(reported_id, msg.chat.id.0, q.from.id.0)
+                                        .await?;
+
                                     let _ = telegram::send_json_request(
                                         &self._token,
                                         AnswerCallbackQuery {
                                             callback_query_id: q.id.clone(),
-                                            text: Some("کاربر گزارش شد و به دیتابیس اسپمرها اضافه شد!".to_string()),
+                                            text: Some(
+                                                "کاربر گزارش شد و به دیتابیس اسپمرها اضافه شد!"
+                                                    .to_string(),
+                                            ),
+                                            url: None,
+                                            cache_time: None,
                                             show_alert: Some(false),
-                                            ..Default::default()
                                         },
-                                    ).await?;
-                                    
+                                    )
+                                    .await?;
+
                                     let _ = telegram::send_json_request(
                                         &self._token,
                                         DeleteMessage {
                                             chat_id: ChatTarget::Id(msg.chat.id),
                                             message_id: msg.message_id,
                                         },
-                                    ).await;
+                                    )
+                                    .await;
                                 } else {
                                     let _ = telegram::send_json_request(
                                         &self._token,
                                         AnswerCallbackQuery {
                                             callback_query_id: q.id.clone(),
-                                            text: Some("فقط ادمین‌های گروه می‌تونن گزارش بدن!".to_string()),
+                                            text: Some(
+                                                "فقط ادمین‌های گروه می‌تونن گزارش بدن!".to_string(),
+                                            ),
                                             show_alert: Some(true),
-                                            ..Default::default()
+                                            url: None,
+                                            cache_time: None,
                                         },
-                                    ).await?;
+                                    )
+                                    .await?;
                                 }
                                 return Response::empty();
                             }
