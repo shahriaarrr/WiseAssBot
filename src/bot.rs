@@ -9,7 +9,7 @@ use rust_persian_tools::{arabic_chars::HasArabic, digits::DigitsEn2Fa, persian_c
 use telegram_types::bot::{
     methods::{
         AnswerCallbackQuery, ApproveJoinRequest, ChatTarget, DeclineJoinRequest, DeleteMessage,
-        GetChatMember, ReplyMarkup, RestrictChatMember, SendMessage, TelegramResult,
+        GetChatMember, ReplyMarkup, RestrictChatMember, SendMessage,
     },
     types::{
         ChatId, ChatMember, ChatMemberStatus, ChatPermissions, InlineKeyboardButton,
@@ -121,7 +121,6 @@ impl Bot {
             .keys;
 
         for key in keys {
-            // TODO: join requests without expiration date are invalid
             if let Some(ttl) = key.expiration {
                 let now = Date::now().as_millis() / 1000;
                 if ttl - now < TTL_LIMIT {
@@ -134,7 +133,6 @@ impl Bot {
                         },
                     )
                     .await;
-                    // the key will be removed automatically after being expired
                 }
             }
         }
@@ -157,7 +155,7 @@ impl Bot {
             })
             .collect::<Vec<InlineKeyboardButton>>();
 
-        let response: TelegramResult<Message> = telegram::send_json_request(
+        let response: Message = telegram::send_json_request(
             &self._token,
             SendMessage::new(ChatTarget::Id(chat_id), message)
                 .parse_mode(ParseMode::Markdown)
@@ -169,18 +167,14 @@ impl Bot {
         .json()
         .await?;
 
-        let message_id = response
-            .result
-            .ok_or("response result empty".to_string())
-            .map_err(|e| Error::RustError(e))?
-            .message_id;
+        let message_id = response.message_id;
         let _ = self
             .kv
             .put(
                 &format!("{}{}:{}", JOIN_PREFIX, chat_id.0, message_id.0),
                 user.id.0,
             )?
-            .expiration_ttl(10 * 60) // FIXME: configurable expiration ttl
+            .expiration_ttl(10 * 60)
             .execute()
             .await?;
 
@@ -271,10 +265,8 @@ impl Bot {
                 }
 
                 if !self.config.bot.allowed_chats_id.contains(&m.chat.id) {
-                    // report unallowed chats
                     return self.forward(&m, self.config.bot.report_chat_id);
                 }
-                // rules
                 for rule in &self.config.bot.rules {
                     for word in &rule.contains {
                         if m.text
@@ -293,7 +285,6 @@ impl Bot {
                         }
                     }
                 }
-                // easter egg: appreciate powers of two!
                 if m.message_id.0 & (m.message_id.0 - 1) == 0 {
                     let reply = format!(
                         include_str!("./response/easter-egg"),
@@ -315,15 +306,12 @@ impl Bot {
                 if !self.config.bot.allowed_chats_id.contains(&r.chat.id) {
                     return Response::empty();
                 }
-                // hotfix: ignore persian names for now
-                // as targeted spam users mostly have a name containing persian chars
                 if r.from.first_name.has_persian(true) || r.from.first_name.has_arabic() {
                     return Response::empty();
                 }
                 return self.chat_join_request(&r.from, r.chat.id).await;
             }
             Some(UpdateContent::CallbackQuery(q)) => {
-                // ignore callbacks without an associated message
                 if let Some(msg) = &q.message {
                     let key = format!("{}{}:{}", JOIN_PREFIX, msg.chat.id.0, msg.message_id.0);
 
@@ -343,7 +331,7 @@ impl Bot {
                                 },
                             )
                             .await;
-                            self.kv.delete(&key).await?; // TODO: remove stale keys within an interval
+                            self.kv.delete(&key).await?;
 
                             return if q.data.as_ref().map(|x| x == answer).unwrap_or_default() {
                                 self.approve_join_request(msg.chat.id, q.from.id)
@@ -361,28 +349,41 @@ impl Bot {
                                     .parse::<i64>()
                                     .map_err(|_| Error::RustError("Invalid user ID".to_string()))?;
 
-                                let is_admin =
-                                    if self.config.bot.admin_users_id.contains(&q.from.id) {
-                                        true
-                                    } else {
-                                        let get_member_res = telegram::send_json_request(
-                                            &self._token,
-                                            GetChatMember {
-                                                chat_id: ChatTarget::Id(msg.chat.id),
-                                                user_id: q.from.id,
-                                            },
-                                        )
-                                        .await?
-                                        .json::<TelegramResult<ChatMember>>()
-                                        .await?;
+                                let is_admin = if self
+                                    .config
+                                    .bot
+                                    .admin_users_id
+                                    .contains(&q.from.id)
+                                {
+                                    true
+                                } else {
+                                    let get_member_res = telegram::send_json_request(
+                                        &self._token,
+                                        GetChatMember {
+                                            chat_id: ChatTarget::Id(msg.chat.id),
+                                            user_id: q.from.id,
+                                        },
+                                    )
+                                    .await?
+                                    .json::<ChatMember>()
+                                    .await;
 
-                                        if let Some(member) = get_member_res.result {
+                                    match get_member_res {
+                                        Ok(member) => {
                                             member.status == ChatMemberStatus::Administrator
                                                 || member.status == ChatMemberStatus::Creator
-                                        } else {
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "Failed to fetch member info (not free plan limit, likely API response issue): {:?}",
+                                                e
+                                            );
+                                            // NOTE: This is not a free plan limit.
+                                            // If stronger consistency needed, consider using D1 instead of KV.
                                             false
                                         }
-                                    };
+                                    }
+                                };
 
                                 if is_admin {
                                     self.log_spammer(reported_id, msg.chat.id.0, q.from.id.0)
@@ -441,7 +442,6 @@ impl Bot {
 
 fn extract_question(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
-    // currently the last line contains the question
     lines[lines.len() - 1].to_string()
 }
 
@@ -449,7 +449,7 @@ fn extract_key_details(text: &str) -> (ChatId, MessageId) {
     let mut chat_id = 0;
     let mut message_id = 0;
 
-    let info = text.strip_prefix(JOIN_PREFIX).unwrap(); // safe to unwrap
+    let info = text.strip_prefix(JOIN_PREFIX).unwrap();
     let info = info
         .split(':')
         .map(|x| x.parse().unwrap_or_default())
