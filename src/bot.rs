@@ -208,12 +208,14 @@ impl Bot {
             inline_keyboard: report_button,
         });
 
-        let _ = telegram::send_json_request(
+        let _: Message = telegram::send_json_request(
             &self._token,
             SendMessage::new(ChatTarget::Id(chat_id), welcome_text)
                 .parse_mode(ParseMode::Markdown)
                 .reply_markup(markup),
         )
+        .await?
+        .json()
         .await?;
 
         Ok(())
@@ -323,6 +325,7 @@ impl Bot {
                             let quiz = Quiz::from_str(&extract_question(&text));
                             let answer = &quiz.answer().to_string();
 
+                            // DeleteMessage فقط true/false داره
                             let _ = telegram::send_json_request(
                                 &self._token,
                                 DeleteMessage {
@@ -349,46 +352,38 @@ impl Bot {
                                     .parse::<i64>()
                                     .map_err(|_| Error::RustError("Invalid user ID".to_string()))?;
 
-                                let is_admin = if self
-                                    .config
-                                    .bot
-                                    .admin_users_id
-                                    .contains(&q.from.id)
-                                {
-                                    true
-                                } else {
-                                    let get_member_res = telegram::send_json_request(
-                                        &self._token,
-                                        GetChatMember {
-                                            chat_id: ChatTarget::Id(msg.chat.id),
-                                            user_id: q.from.id,
-                                        },
-                                    )
-                                    .await?
-                                    .json::<ChatMember>()
-                                    .await;
+                                let is_admin =
+                                    if self.config.bot.admin_users_id.contains(&q.from.id) {
+                                        true
+                                    } else {
+                                        let get_member_res = telegram::send_json_request(
+                                            &self._token,
+                                            GetChatMember {
+                                                chat_id: ChatTarget::Id(msg.chat.id),
+                                                user_id: q.from.id,
+                                            },
+                                        )
+                                        .await?
+                                        .json::<ChatMember>()
+                                        .await;
 
-                                    match get_member_res {
-                                        Ok(member) => {
-                                            member.status == ChatMemberStatus::Administrator
-                                                || member.status == ChatMemberStatus::Creator
+                                        match get_member_res {
+                                            Ok(member) => {
+                                                member.status == ChatMemberStatus::Administrator
+                                                    || member.status == ChatMemberStatus::Creator
+                                            }
+                                            Err(e) => {
+                                                eprintln!("Failed to fetch member info: {:?}", e);
+                                                false
+                                            }
                                         }
-                                        Err(e) => {
-                                            eprintln!(
-                                                "Failed to fetch member info (not free plan limit, likely API response issue): {:?}",
-                                                e
-                                            );
-                                            // NOTE: This is not a free plan limit.
-                                            // If stronger consistency needed, consider using D1 instead of KV.
-                                            false
-                                        }
-                                    }
-                                };
+                                    };
 
                                 if is_admin {
                                     self.log_spammer(reported_id, msg.chat.id.0, q.from.id.0)
                                         .await?;
 
+                                    // AnswerCallbackQuery خروجی bool داره
                                     let _ = telegram::send_json_request(
                                         &self._token,
                                         AnswerCallbackQuery {
